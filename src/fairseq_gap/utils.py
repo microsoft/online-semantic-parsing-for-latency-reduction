@@ -1,0 +1,156 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+import time
+import math
+
+from fairseq.tokenizer import tokenize_line
+
+# from fairseq_ext.amr_reform.o10_action_reformer_subtok import AMRActionReformerSubtok
+
+from .constants import SpecialSymbols, join_action_pointer
+from fairseq_gap.actions_interface.source_copy import join_edge_and_copy_pointer
+
+
+def replace_unk(hypo_str, src_str, alignment, align_dict, unk, line_tokenizer=tokenize_line):
+    # Tokens are strings here
+    hypo_tokens = line_tokenizer(hypo_str)
+    # TODO: Very rare cases where the replacement is '<eos>' should be handled gracefully
+    src_tokens = line_tokenizer(src_str) + ['<eos>']
+    for i, ht in enumerate(hypo_tokens):
+        if ht == unk:
+            src_token = src_tokens[alignment[i]]
+            # Either take the corresponding value in the aligned dictionary or just copy the original value.
+            hypo_tokens[i] = align_dict.get(src_token, src_token)
+    return ' '.join(hypo_tokens)
+
+
+def post_process_prediction(hypo_tokens, src_str, alignment, align_dict, tgt_dict,
+                            remove_bpe=None, split_token=' ', line_tokenizer=tokenize_line):
+    # TODO check consistency of "split_token" and "tokenize_line"
+    # TODO "line_tokenizer" not fed into "replact_unk"
+    # hypo_str = tgt_dict.string(hypo_tokens, remove_bpe, split_token=split_token)
+    hypo_str = split_token.join([tgt_dict[i] for i in hypo_tokens if i != tgt_dict.eos()])
+    if align_dict is not None:
+        hypo_str = replace_unk(hypo_str, src_str, alignment, align_dict, tgt_dict.unk_string())
+    if align_dict is not None or remove_bpe is not None:
+        # Convert back to tokens for evaluating with unk replacement or without BPE
+        # Note that the dictionary can be modified inside the method.
+        hypo_tokens = tgt_dict.encode_line(hypo_str, add_if_not_exist=True, line_tokenizer=tokenize_line)
+    return hypo_tokens, hypo_str, alignment
+
+
+def post_process_action_pointer_prediction(hypo, tgt_dict):
+    """Post processing the prediction of both actions and corresponding pointer values."""
+    # need to manually take care of eos, which is always included in the beam search output
+    actions_nopos = [tgt_dict[i] for i in hypo['tokens'] if i != tgt_dict.eos()]    # or hypo['tokens'].tolist()
+    actions_pos = hypo['pointer_tgt'].tolist()[:-1]
+    # refine the pointer sequence to use -1 for all the non-arc actions
+    actions_pos = [pos if act.startswith(SpecialSymbols.LA) or act.startswith(SpecialSymbols.RA) else -1
+                   for act, pos in zip(actions_nopos, actions_pos)]
+    assert len(actions_nopos) == len(actions_pos)
+    actions = [join_action_pointer(act, pos) for act, pos in zip(actions_nopos, actions_pos)]
+    return actions_nopos, actions_pos, actions
+
+
+def post_process_action_pointer_prediction_scp(hypo, tgt_dict, src_tokens):
+    """Post processing the prediction of both actions and corresponding pointer values."""
+    # need to manually take care of eos, which is always included in the beam search output
+    actions_nopos = [tgt_dict[i] for i in hypo['tokens'] if i != tgt_dict.eos()]    # or hypo['tokens'].tolist()
+    actions_pos = hypo['pointer_tgt'].tolist()[:-1]
+    actions_src_pos = hypo['pointer_src'].tolist()[:-1]
+    # refine the pointer sequence to use -1 for all the non-arc actions
+    actions_pos = [pos if act.startswith(SpecialSymbols.LA) or act.startswith(SpecialSymbols.RA) else -1
+                   for act, pos in zip(actions_nopos, actions_pos)]
+    assert len(actions_nopos) == len(actions_pos) == len(actions_src_pos)
+    actions_scp = [join_edge_and_copy_pointer(act, pos, src_pos)
+               for act, pos, src_pos in zip(actions_nopos, actions_pos, actions_src_pos)]
+
+    # recover the original actions that can be run with the base state machine
+    from fairseq_gap.actions_interface.source_copy import CalFlowActionsSrcCopyInterface
+    actions = CalFlowActionsSrcCopyInterface.recover_copy_with_token(src_tokens, actions_scp)
+
+    return actions_nopos, actions_pos, actions_src_pos, actions_scp, actions
+
+
+def post_process_action_pointer_prediction_bartsv(hypo, tgt_dict):
+    """Post processing the prediction of actions and pointer values, for BART-share-vocabulary model."""
+    # need to manually take care of eos, which is always included in the beam search output
+    actions_nopos = [tgt_dict[i] for i in hypo['tokens'] if i != tgt_dict.eos()]    # or hypo['tokens'].tolist()
+    actions_pos = hypo['pointer_tgt'].tolist()[:-1]
+
+    # NOTE need to be imported here to avoid error, since in below "join_action_pointer" from this file is imported
+    from fairseq_ext.amr_reform.o10_action_reformer_subtok import AMRActionReformerSubtok
+
+    rec_actions_nopos, rec_actions_pos, rec_actions = AMRActionReformerSubtok.recover_actions(
+        actions_nopos, actions_pos, tgt_dict)
+    return rec_actions_nopos, rec_actions_pos, rec_actions
+
+
+def clean_pointer_arcs(actions_nopos, actions_pos, actions):
+    """Clean action sequence by removing self-loops and multi-edges (regardless of the arc labels)."""
+    arcs = []
+    arcs_start_idx = None
+    invalid_idx = []    # invalid index of the original sequence
+    actions_nopos_new = []
+    actions_pos_new = []
+    actions_new = []
+    pos_map = []        # index map from previous sequence to the cleanned sequence
+    num_popped = 0      # number of elements that are popped out
+    for i, v in enumerate(actions_pos):
+        if v != -1:
+            if not arcs:
+                # first position of the arc sub-sequence
+                arcs_start_idx = i
+                # check: if self-loop
+                if v == arcs_start_idx - 1:
+                    invalid_idx.append(i)
+                    num_popped += 1
+                    pos_map.append(None)
+                else:
+                    arcs.append(v)
+                    actions_pos_new.append(pos_map[v])
+                    actions_nopos_new.append(actions_nopos[i])
+                    pos_map.append(i - num_popped)
+            else:
+                # not first position of the arc sub-sequence
+                # check: if multi-edge
+                if v in arcs or v == arcs_start_idx - 1:
+                    invalid_idx.append(i)
+                    num_popped += 1
+                    pos_map.append(None)
+                else:
+                    arcs.append(v)
+                    actions_pos_new.append(pos_map[v])
+                    actions_nopos_new.append(actions_nopos[i])
+                    pos_map.append(i - num_popped)
+        else:
+            if arcs:
+                arcs = []
+
+            actions_pos_new.append(v)    # here v is -1
+            actions_nopos_new.append(actions_nopos[i])
+
+            pos_map.append(i - num_popped)
+
+    assert len(pos_map) == len(actions_pos)
+
+    # we have to rejoin since the pointer values have changed
+    actions_new = [join_action_pointer(act, pos) for act, pos in zip(actions_nopos_new, actions_pos_new)]
+
+    return actions_nopos_new, actions_pos_new, actions_new, invalid_idx
+
+
+def time_since(start):
+    now = time.time()
+    s = now - start
+    m = math.floor(s / 60)
+    s -= m * 60
+    h = math.floor(m / 60)
+    m -= h * 60
+    if h == 0:
+        if m == 0:
+            return '%ds' % s
+        else:
+            return '%dm %ds' % (m, s)
+    else:
+        return '%dh %dm %ds' % (h, m, s)
